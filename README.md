@@ -19,7 +19,11 @@ I would like to solder it myself!
 - 6x M3x5mx4mm heatset inserts
 
 # Photos!
-
-<img width="1169" height="820" alt="image" src="https://github.com/user-attachments/assets/b91d9036-5f3d-4e38-966e-2a17ab6904a5" />
 <img width="3296" height="2547" alt="Master Assembly (3)" src="https://github.com/user-attachments/assets/e6ed8c9b-b911-41e7-8a6f-5e20da170886" />
+<img width="3296" height="2547" alt="Master Assembly (4)" src="https://github.com/user-attachments/assets/1ea21504-123e-458e-959f-2af895c2226f" />
+<img width="1169" height="820" alt="image" src="https://github.com/user-attachments/assets/b91d9036-5f3d-4e38-966![Uploading Master Assembly (4).png…]()
+e-2a17ab6904a5" />
 <img width="1027" height="514" alt="image" src="https://github.com/user-attachments/assets/8ca75960-cfcc-4e68-a0c7-f0b780dd4d8e" />
+
+# Colors
+If possible, could I get each part of the case in its respective colors? 
