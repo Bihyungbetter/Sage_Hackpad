@@ -2,11 +2,8 @@
 
 ## Overview
 
-I'm Michael, and this is my Macropad! The EVA-01. It features 10 inputs, has 9 switches, one knob, and an OLED display! 
-I would like to solder it myself!
-
-## About 
-
+I'm Michael, and this is my Macropad! It is inspired by the Sage Agent from Valorant. It features 10 inputs, has 9 switches, one knob, and an OLED display! 
+I would like to solder it myself! 
 
 # BOM:
 - 1x Seeed XIAO RP2040
@@ -23,8 +20,6 @@ I would like to solder it myself!
 
 # Photos!
 
-
-
-## Colors
-
-May I please get the case in white?
+<img width="1169" height="820" alt="image" src="https://github.com/user-attachments/assets/b91d9036-5f3d-4e38-966e-2a17ab6904a5" />
+<img width="3296" height="2547" alt="Master Assembly (3)" src="https://github.com/user-attachments/assets/e6ed8c9b-b911-41e7-8a6f-5e20da170886" />
+<img width="1027" height="514" alt="image" src="https://github.com/user-attachments/assets/8ca75960-cfcc-4e68-a0c7-f0b780dd4d8e" />
