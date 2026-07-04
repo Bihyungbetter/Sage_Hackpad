@@ -1,0 +1,74 @@
+{
+    "manufacturer": "Michael",
+    "keyboard_name": "sage_hackpad",
+    "maintainer": "BihyungBetter",
+    "bootloader": "rp2040",
+    "processor": "RP2040",
+    "url": "https://github.com/BihyungBetter/sage_hackpad",
+    "usb": {
+        "vid": "0xFEED",
+        "pid": "0x0000",
+        "device_version": "1.0.0"
+    },
+    "features": {
+        "bootmagic": true,
+        "command": false,
+        "console": false,
+        "extrakey": true,
+        "mousekey": true,
+        "nkro": true,
+        "encoder": true,
+        "rgb_matrix": true,
+        "oled": true
+    },
+    "matrix_pins": {
+        "cols": ["GP3", "GP4", "GP2"],
+        "rows": ["GP1", "GP0", "GP29"]
+    },
+    "diode_direction": "COL2ROW",
+    "encoder": {
+        "rotary": [
+            { "pin_a": "GP27", "pin_b": "GP28" }
+        ]
+    },
+    "ws2812": {
+        "pin": "GP26",
+        "driver": "vendor"
+    },
+    "rgb_matrix": {
+        "driver": "ws2812",
+        "animations": {
+            "breathing": true,
+            "cycle_all": true,
+            "cycle_left_right": true,
+            "rainbow_moving_chevron": true,
+            "solid_color": true
+        },
+        "layout": [
+            { "matrix": [0, 0], "x": 0,   "y": 0,  "flags": 4 },
+            { "matrix": [0, 1], "x": 112, "y": 0,  "flags": 4 },
+            { "matrix": [0, 2], "x": 224, "y": 0,  "flags": 4 },
+            { "matrix": [1, 2], "x": 224, "y": 32, "flags": 4 },
+            { "matrix": [1, 1], "x": 112, "y": 32, "flags": 4 },
+            { "matrix": [1, 0], "x": 0,   "y": 32, "flags": 4 },
+            { "matrix": [2, 0], "x": 0,   "y": 64, "flags": 4 },
+            { "matrix": [2, 1], "x": 112, "y": 64, "flags": 4 },
+            { "matrix": [2, 2], "x": 224, "y": 64, "flags": 4 }
+        ]
+    },
+    "layouts": {
+        "LAYOUT": {
+            "layout": [
+                {"matrix": [0, 0], "x": 0, "y": 0},
+                {"matrix": [0, 1], "x": 1, "y": 0},
+                {"matrix": [0, 2], "x": 2, "y": 0},
+                {"matrix": [1, 0], "x": 0, "y": 1},
+                {"matrix": [1, 1], "x": 1, "y": 1},
+                {"matrix": [1, 2], "x": 2, "y": 1},
+                {"matrix": [2, 0], "x": 0, "y": 2},
+                {"matrix": [2, 1], "x": 1, "y": 2},
+                {"matrix": [2, 2], "x": 2, "y": 2}
+            ]
+        }
+    }
+}
