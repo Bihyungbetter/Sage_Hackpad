@@ -29,6 +29,22 @@ void keyboard_post_init_user(void) {
 }
 
 
+// Each Scroll Lock toggle from the host steps LED brightness down: 200 -> 150 -> 100 -> 50 -> 200.
+bool led_update_user(led_t led_state) {
+    static bool seen = false;
+    static bool last_scroll;
+    if (!seen) {
+        seen        = true;
+        last_scroll = led_state.scroll_lock;
+    } else if (led_state.scroll_lock != last_scroll) {
+        last_scroll = led_state.scroll_lock;
+        uint8_t val = rgb_matrix_get_val();
+        val         = val > 75 ? val - 50 : RGB_MATRIX_MAXIMUM_BRIGHTNESS;
+        rgb_matrix_sethsv_noeeprom(rgb_matrix_get_hue(), rgb_matrix_get_sat(), val);
+    }
+    return true;
+}
+
 #ifdef OLED_ENABLE
 bool oled_task_user(void) {
     oled_write_P(PSTR("Hackpad\n\n"), false);
