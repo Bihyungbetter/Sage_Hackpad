@@ -15,3 +15,6 @@
 #define WS2812_T1H 1000
 
 #define ENCODER_RESOLUTION 4
+
+// Keep the Spotify widget on instead of blanking after 60s without key presses.
+#define OLED_TIMEOUT 0
