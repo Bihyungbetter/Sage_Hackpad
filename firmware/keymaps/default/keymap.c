@@ -19,6 +19,10 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][NUM_DIRECTIONS] = {
 #endif
 
 void keyboard_post_init_user(void) {
+    // The ws2812 driver leaves the data pin at the 2mA default; drive it at 12mA
+    // so the 3.3V signal clears the LEDs' input threshold with more margin.
+    palSetLineMode(GP26, PAL_RP_PAD_SLEWFAST | PAL_RP_PAD_DRIVE12 | PAL_RP_GPIO_OE | PAL_MODE_ALTERNATE_PIO1);
+
     rgb_matrix_enable_noeeprom();
     rgb_matrix_mode_noeeprom(RGB_MATRIX_SOLID_COLOR);
     rgb_matrix_sethsv_noeeprom(128, 255, 255); 

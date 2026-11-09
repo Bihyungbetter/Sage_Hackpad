@@ -8,4 +8,10 @@
 
 #define WS2812_PIO_USE_PIO1
 
+// SK6812MINI-E: VIH is 0.65*VDD (~3.25V), barely below the RP2040's 3.3V output.
+// Use the longest in-spec high times so late-detected edges still decode correctly.
+#define WS2812_TIMING 1300
+#define WS2812_T0H 400
+#define WS2812_T1H 1000
+
 #define ENCODER_RESOLUTION 4
