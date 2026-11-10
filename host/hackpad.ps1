@@ -11,13 +11,15 @@ param([Parameter(Mandatory)][string]$Command, [Parameter(ValueFromRemainingArgum
 
 . "$PSScriptRoot\hackpad_link.ps1"
 
-$packets = switch ($Command) {
-    'led-all' { , [byte[]](0x10, 1); , [byte[]](@(0x12) + $Values[0..2]) }
-    'led'     { , [byte[]](0x10, 1); , [byte[]](@(0x11) + $Values[0..3]) }
-    'led-off' { , [byte[]](0x10, 0) }
-    'hsv'     { , [byte[]](@(0x13) + $Values[0..2]) }
-    'rotate'  { , [byte[]](0x20, $Values[0]) }
-    'boot'    { , [byte[]](0xB0, 0x5A, 0xA5) }
+# Build a list of byte[] packets (List keeps single packets from being unrolled into bytes).
+$packets = New-Object 'System.Collections.Generic.List[byte[]]'
+switch ($Command) {
+    'led-all' { $packets.Add([byte[]](0x10, 1)); $packets.Add([byte[]](@(0x12) + $Values[0..2])) }
+    'led'     { $packets.Add([byte[]](0x10, 1)); $packets.Add([byte[]](@(0x11) + $Values[0..3])) }
+    'led-off' { $packets.Add([byte[]](0x10, 0)) }
+    'hsv'     { $packets.Add([byte[]](@(0x13) + $Values[0..2])) }
+    'rotate'  { $packets.Add([byte[]](0x20, $Values[0])) }
+    'boot'    { $packets.Add([byte[]](0xB0, 0x5A, 0xA5)) }
     default   { throw "Unknown command '$Command'" }
 }
 

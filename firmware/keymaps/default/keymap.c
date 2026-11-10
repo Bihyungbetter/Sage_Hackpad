@@ -1,6 +1,7 @@
 #include QMK_KEYBOARD_H
 #include <string.h>
 #include "raw_hid.h"
+#include "pets_data.h"
 
 enum layers { _BASE, _FN };
 
@@ -12,7 +13,7 @@ enum layers { _BASE, _FN };
 #define SPOTIFY  C(A(S(KC_S)))     // Start Menu shortcut: open Spotify
 #define DESKTOP  G(KC_D)           // Show desktop
 #define MIC_MUTE G(A(KC_K))        // Windows 11 microphone mute
-#define TASKMGR  C(S(KC_ESC))      // Task Manager
+enum custom_keycodes { PET_NEXT = SAFE_RANGE }; // switch the idle OLED pet
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     /* Knob and OLED at the top.
@@ -27,12 +28,12 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     ),
     /*  Bootloader  LEDs on/off   LED effect
      *  Paste last  Hands-free    Mic mute
-     *  (held)      Print Screen  Task Manager
+     *  (held)      Print Screen  Switch pet
      */
     [_FN] = LAYOUT(
         QK_BOOT,  RM_TOGG,  RM_NEXT,
         WISPR_PL, WISPR_HF, MIC_MUTE,
-        _______,  KC_PSCR,  TASKMGR
+        _______,  KC_PSCR,  PET_NEXT
     )
 };
 
@@ -191,52 +192,87 @@ static void write_marquee(uint8_t line, const char *text, uint16_t tick) {
     oled_write(out, false);
 }
 
-// Quarter-wave sine table, 64 steps per turn, amplitude 127.
-static const int8_t sine_q[17] = {0, 12, 25, 37, 49, 60, 71, 81, 90, 98, 106, 112, 117, 122, 125, 126, 127};
+/* ---------- Idle pets (community animations, see pets_data.h) ---------- */
+static uint32_t press_times[8];
+static uint8_t  press_idx;
 
-static int8_t isin(uint8_t a) {
-    a &= 63;
-    if (a < 16) return sine_q[a];
-    if (a < 32) return sine_q[32 - a];
-    if (a < 48) return -sine_q[a - 32];
-    return -sine_q[64 - a];
-}
-#define icos(a) isin((a) + 16)
-
-static void fill_block(int16_t x, int16_t y, uint8_t size) {
-    for (uint8_t dy = 0; dy < size; dy++)
-        for (uint8_t dx = 0; dx < size; dx++) oled_write_pixel(x + dx, y + dy, true);
+static uint8_t presses_within(uint32_t ms) {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < 8; i++)
+        if (press_times[i] && timer_elapsed32(press_times[i]) < ms) n++;
+    return n;
 }
 
-// Idle screen: Sage's healing orb pulsing with orbiting particles, beside a flowing wave.
-static void draw_idle_animation(uint16_t t) {
-    const int16_t cx = 18, cy = 16;
-
-    int8_t r = 5 + isin(t * 2) * 2 / 127;
-    for (int8_t dy = -r; dy <= r; dy++)
-        for (int8_t dx = -r; dx <= r; dx++)
-            if (dx * dx + dy * dy <= r * r) oled_write_pixel(cx + dx, cy + dy, true);
-
-    for (uint8_t i = 0; i < 16; i += 2) {
-        uint8_t a = i * 4 + t;
-        oled_write_pixel(cx + icos(a) * 10 / 127, cy + isin(a) * 10 / 127, true);
+// Bongo Cat: idles, raises its paws after a key press, and slaps the desk on each press.
+static void render_bongo(uint16_t frame) {
+    uint32_t    last = press_times[(press_idx - 1) & 7];
+    const char *f;
+    if (last && timer_elapsed32(last) < 150) {
+        f = bongo_tap[press_idx & 1]; // alternate paws
+    } else if (last && timer_elapsed32(last) < 1500) {
+        f = bongo_prep[0];
+    } else {
+        f = bongo_idle[(frame / 4) % 5];
     }
+    oled_set_cursor(0, 0);
+    oled_write_raw_P(f, 512);
+}
 
-    for (uint8_t k = 0; k < 3; k++) {
-        uint8_t a = k * 21 - t * 2;
-        fill_block(cx + icos(a) * 15 / 127 - 1, cy + isin(a) * 13 / 127 - 1, 2);
+// Draws a 32x24 page-format sprite at pixel column x (may be partly off screen), pages 1-3.
+static void draw_luna_sprite(const char *sprite, int16_t x) {
+    for (uint8_t p = 0; p < 3; p++)
+        for (uint8_t c = 0; c < 32; c++) {
+            int16_t col = x + c;
+            if (col >= 0 && col < 128) oled_write_raw_byte(pgm_read_byte(sprite + p * 32 + c), (p + 1) * 128 + col);
+        }
+}
+
+// Luna: sits when idle, walks or runs across the screen as you press keys,
+// barks with Caps Lock and sneaks while Ctrl or Shift is held.
+static void render_luna(uint16_t frame) {
+    static int16_t x = 48;
+    uint8_t        f      = (frame / 4) % 2;
+    uint8_t        recent = presses_within(2000);
+    const char    *s;
+    if (host_keyboard_led_state().caps_lock) {
+        s = luna_bark[f];
+    } else if (get_mods() & MOD_MASK_CS) {
+        s = luna_sneak[f];
+        if (frame % 4 == 0) x++;
+    } else if (recent >= 4) {
+        s = luna_run[f];
+        x += 2;
+    } else if (recent >= 1) {
+        s = luna_walk[f];
+        if (frame % 2 == 0) x++;
+    } else {
+        s = luna_sit[f];
     }
+    if (x > 128) x = -32;
+    draw_luna_sprite(s, x);
+}
 
-    for (uint8_t x = 42; x < 128; x++) {
-        int16_t y = 25 + (isin(x * 2 + t * 3) * 4 + isin(x * 5 - t * 2) * 2) / 127;
-        oled_write_pixel(x, y, true);
-        oled_write_pixel(x, y + 1, true);
+enum pets { PET_BONGO, PET_LUNA, PET_COUNT };
+static uint8_t current_pet = PET_BONGO;
+
+static void render_pet(uint16_t frame) {
+    if (current_pet == PET_LUNA) {
+        render_luna(frame);
+    } else {
+        render_bongo(frame);
     }
+}
 
-    oled_set_cursor(7, 0);
-    oled_write_P(PSTR("Sage Hackpad"), false);
-    oled_set_cursor(7, 1);
-    oled_write_P(host_seen ? PSTR("Spotify idle") : PSTR("no PC link"), false);
+bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    if (record->event.pressed) {
+        uint32_t now = timer_read32();
+        press_times[press_idx++ & 7] = now ? now : 1;
+        if (keycode == PET_NEXT) {
+            current_pet = (current_pet + 1) % PET_COUNT;
+            return false;
+        }
+    }
+    return true;
 }
 
 bool oled_task_user(void) {
@@ -256,7 +292,7 @@ bool oled_task_user(void) {
         oled_write_P(PSTR("Fn  knob=brightness\n"), true);
         oled_write_P(PSTR("Boot   LEDs   Effect\n"), false);
         oled_write_P(PSTR("Paste  Hands  MicOff\n"), false);
-        oled_write_P(PSTR("       PrtSc  TaskMgr"), false);
+        oled_write_P(PSTR("       PrtSc  Pet"), false);
         return false;
     }
 
@@ -268,7 +304,7 @@ bool oled_task_user(void) {
             oled_write_P(PSTR("Claude Wispr  Mute\n"), false);
             oled_write_P(PSTR("Fn     Spot   Desk"), false);
         } else {
-            draw_idle_animation(frame);
+            render_pet(frame);
         }
         return false;
     }
