@@ -4,6 +4,7 @@
 #   hackpad.ps1 led-off                       back to the firmware's own colors
 #   hackpad.ps1 hsv <h> <s> <v>               firmware solid color (0-255 each, v max 200)
 #   hackpad.ps1 rotate <0-3>                  OLED rotation (0, 90, 180, 270 degrees)
+#   hackpad.ps1 boot                          reboot into the UF2 bootloader (RPI-RP2 drive) for flashing
 # Wire bytes go to the LED in the order given; the firmware does no color reordering in this mode.
 
 param([Parameter(Mandatory)][string]$Command, [Parameter(ValueFromRemainingArguments)][int[]]$Values)
@@ -16,6 +17,7 @@ $packets = switch ($Command) {
     'led-off' { , [byte[]](0x10, 0) }
     'hsv'     { , [byte[]](@(0x13) + $Values[0..2]) }
     'rotate'  { , [byte[]](0x20, $Values[0]) }
+    'boot'    { , [byte[]](0xB0, 0x5A, 0xA5) }
     default   { throw "Unknown command '$Command'" }
 }
 

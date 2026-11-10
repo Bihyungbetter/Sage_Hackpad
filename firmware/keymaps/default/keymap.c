@@ -9,7 +9,7 @@ enum layers { _BASE, _FN };
 #define WISPR    C(KC_LGUI)        // Wispr Flow push-to-talk (hold Ctrl+Win)
 #define WISPR_HF C(G(KC_SPC))      // Wispr Flow hands-free toggle
 #define WISPR_PL S(A(KC_Z))        // Wispr Flow paste last dictation
-#define SNIP     G(S(KC_S))        // Snipping Tool
+#define SPOTIFY  C(A(S(KC_S)))     // Start Menu shortcut: open Spotify
 #define DESKTOP  G(KC_D)           // Show desktop
 #define MIC_MUTE G(A(KC_K))        // Windows 11 microphone mute
 #define TASKMGR  C(S(KC_ESC))      // Task Manager
@@ -18,12 +18,12 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     /* Knob and OLED at the top.
      *  Prev    Play/Pause  Next
      *  Claude  Wispr       Mute
-     *  Fn      Snip        Desktop
+     *  Fn      Spotify     Desktop
      */
     [_BASE] = LAYOUT(
         KC_MPRV, KC_MPLY,  KC_MNXT,
         CLAUDE,  WISPR,    KC_MUTE,
-        MO(_FN), SNIP,     DESKTOP
+        MO(_FN), SPOTIFY,  DESKTOP
     ),
     /*  Bootloader  LEDs on/off   LED effect
      *  Paste last  Hands-free    Mic mute
@@ -83,6 +83,7 @@ bool led_update_user(led_t led_state) {
  * 0x12 b0 b1 b2                override all LEDs' wire bytes
  * 0x13 h s v                   solid color for the normal (non-override) mode
  * 0x20 rotation                OLED rotation 0-3 (0, 90, 180, 270 degrees)
+ * 0xB0 0x5A 0xA5               reboot into the UF2 bootloader (for flashing from the host)
  */
 #define TEXT_MAX 64
 
@@ -126,6 +127,9 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
 #ifdef OLED_ENABLE
         case 0x20: oled_init(data[1] & 3); break;
 #endif
+        case 0xB0:
+            if (data[1] == 0x5A && data[2] == 0xA5) reset_keyboard(); // jump to the UF2 bootloader
+            break;
     }
 }
 
@@ -187,12 +191,61 @@ static void write_marquee(uint8_t line, const char *text, uint16_t tick) {
     oled_write(out, false);
 }
 
+// Quarter-wave sine table, 64 steps per turn, amplitude 127.
+static const int8_t sine_q[17] = {0, 12, 25, 37, 49, 60, 71, 81, 90, 98, 106, 112, 117, 122, 125, 126, 127};
+
+static int8_t isin(uint8_t a) {
+    a &= 63;
+    if (a < 16) return sine_q[a];
+    if (a < 32) return sine_q[32 - a];
+    if (a < 48) return -sine_q[a - 32];
+    return -sine_q[64 - a];
+}
+#define icos(a) isin((a) + 16)
+
+static void fill_block(int16_t x, int16_t y, uint8_t size) {
+    for (uint8_t dy = 0; dy < size; dy++)
+        for (uint8_t dx = 0; dx < size; dx++) oled_write_pixel(x + dx, y + dy, true);
+}
+
+// Idle screen: Sage's healing orb pulsing with orbiting particles, beside a flowing wave.
+static void draw_idle_animation(uint16_t t) {
+    const int16_t cx = 18, cy = 16;
+
+    int8_t r = 5 + isin(t * 2) * 2 / 127;
+    for (int8_t dy = -r; dy <= r; dy++)
+        for (int8_t dx = -r; dx <= r; dx++)
+            if (dx * dx + dy * dy <= r * r) oled_write_pixel(cx + dx, cy + dy, true);
+
+    for (uint8_t i = 0; i < 16; i += 2) {
+        uint8_t a = i * 4 + t;
+        oled_write_pixel(cx + icos(a) * 10 / 127, cy + isin(a) * 10 / 127, true);
+    }
+
+    for (uint8_t k = 0; k < 3; k++) {
+        uint8_t a = k * 21 - t * 2;
+        fill_block(cx + icos(a) * 15 / 127 - 1, cy + isin(a) * 13 / 127 - 1, 2);
+    }
+
+    for (uint8_t x = 42; x < 128; x++) {
+        int16_t y = 25 + (isin(x * 2 + t * 3) * 4 + isin(x * 5 - t * 2) * 2) / 127;
+        oled_write_pixel(x, y, true);
+        oled_write_pixel(x, y + 1, true);
+    }
+
+    oled_set_cursor(7, 0);
+    oled_write_P(PSTR("Sage Hackpad"), false);
+    oled_set_cursor(7, 1);
+    oled_write_P(host_seen ? PSTR("Spotify idle") : PSTR("no PC link"), false);
+}
+
 bool oled_task_user(void) {
     static uint32_t frame_timer;
-    static uint16_t tick;
-    if (timer_elapsed32(frame_timer) < 250) return false;
+    static uint16_t frame;
+    if (timer_elapsed32(frame_timer) < 50) return false;
     frame_timer = timer_read32();
-    tick++;
+    frame++;
+    uint16_t tick = frame / 5; // marquee step every 250ms
 
     bool active = host_seen && timer_elapsed32(host_stamp) < 5000 && play_status != 0;
 
@@ -207,21 +260,22 @@ bool oled_task_user(void) {
         return false;
     }
 
+    if (!active) {
+        // Show the key legend for the first 5 seconds after plugging in, then animate.
+        if (timer_read32() < 5000) {
+            oled_write_P(PSTR("Sage Hackpad  keys:\n"), true);
+            oled_write_P(PSTR("Prev   Play   Next\n"), false);
+            oled_write_P(PSTR("Claude Wispr  Mute\n"), false);
+            oled_write_P(PSTR("Fn     Spot   Desk"), false);
+        } else {
+            draw_idle_animation(frame);
+        }
+        return false;
+    }
+
     draw_icon(0, 0, spotify_icon);
     oled_set_cursor(2, 0);
     oled_write_P(PSTR("Spotify"), false);
-
-    if (!active) {
-        oled_set_cursor(10, 0);
-        oled_write_P(host_seen ? PSTR("idle") : PSTR("no PC link"), false);
-        oled_set_cursor(0, 1);
-        oled_write_P(PSTR("Prev   Play   Next"), false);
-        oled_set_cursor(0, 2);
-        oled_write_P(PSTR("Claude Wispr  Mute"), false);
-        oled_set_cursor(0, 3);
-        oled_write_P(PSTR("Fn     Snip   Desk"), false);
-        return false;
-    }
 
     bool     playing = play_status == 2;
     uint16_t pos     = play_pos;
