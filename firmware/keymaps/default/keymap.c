@@ -2,34 +2,60 @@
 #include <string.h>
 #include "raw_hid.h"
 
+enum layers { _BASE, _FN };
+
+// Host-side actions bound to hotkeys:
+#define CLAUDE   C(A(S(KC_C)))     // Start Menu shortcut: VS Code -> vscode://anthropic.claude-code/open
+#define WISPR    C(KC_LGUI)        // Wispr Flow push-to-talk (hold Ctrl+Win)
+#define WISPR_HF C(G(KC_SPC))      // Wispr Flow hands-free toggle
+#define WISPR_PL S(A(KC_Z))        // Wispr Flow paste last dictation
+#define SNIP     G(S(KC_S))        // Snipping Tool
+#define DESKTOP  G(KC_D)           // Show desktop
+#define MIC_MUTE G(A(KC_K))        // Windows 11 microphone mute
+#define TASKMGR  C(S(KC_ESC))      // Task Manager
+
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
-    /*  7 8 9
-     *  4 5 6
-     *  1 2 3
+    /* Knob and OLED at the top.
+     *  Prev    Play/Pause  Next
+     *  Claude  Wispr       Mute
+     *  Fn      Snip        Desktop
      */
-    [0] = LAYOUT(
-        KC_7,    KC_8,    KC_9,
-        KC_4,    KC_5,    KC_6,
-        KC_1,    KC_2,    KC_3
+    [_BASE] = LAYOUT(
+        KC_MPRV, KC_MPLY,  KC_MNXT,
+        CLAUDE,  WISPR,    KC_MUTE,
+        MO(_FN), SNIP,     DESKTOP
+    ),
+    /*  Bootloader  LEDs on/off   LED effect
+     *  Paste last  Hands-free    Mic mute
+     *  (held)      Print Screen  Task Manager
+     */
+    [_FN] = LAYOUT(
+        QK_BOOT,  RM_TOGG,  RM_NEXT,
+        WISPR_PL, WISPR_HF, MIC_MUTE,
+        _______,  KC_PSCR,  TASKMGR
     )
 };
 
 #if defined(ENCODER_MAP_ENABLE)
 const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][NUM_DIRECTIONS] = {
-    [0] = { ENCODER_CCW_CW(KC_VOLD, KC_VOLU) },
+    [_BASE] = { ENCODER_CCW_CW(KC_VOLD, KC_VOLU) },
+    [_FN]   = { ENCODER_CCW_CW(RM_VALD, RM_VALU) },
 };
 #endif
 
 #define DEFAULT_LED_VAL 80
+#define DEFAULT_LED_SPD 64
 
 void keyboard_post_init_user(void) {
     // The ws2812 driver leaves the data pin at the 2mA default; drive it at 12mA
     // so the 3.3V signal clears the LEDs' input threshold with more margin.
     palSetLineMode(GP26, PAL_RP_PAD_SLEWFAST | PAL_RP_PAD_DRIVE12 | PAL_RP_GPIO_OE | PAL_MODE_ALTERNATE_PIO1);
 
+    // Slow rainbow fade across all keys.
     rgb_matrix_enable_noeeprom();
-    rgb_matrix_mode_noeeprom(RGB_MATRIX_SOLID_COLOR);
-    rgb_matrix_sethsv_noeeprom(128, 255, DEFAULT_LED_VAL);
+    rgb_matrix_mode_noeeprom(RGB_MATRIX_CYCLE_ALL);
+    rgb_matrix_sethsv_noeeprom(0, 255, DEFAULT_LED_VAL);
+    rgb_matrix_set_speed_noeeprom(DEFAULT_LED_SPD);
 }
 
 // Each Scroll Lock toggle from the host steps LED brightness up: 40 -> 80 -> 120 -> 160 -> 200 -> 40.
@@ -171,15 +197,29 @@ bool oled_task_user(void) {
     bool active = host_seen && timer_elapsed32(host_stamp) < 5000 && play_status != 0;
 
     oled_clear();
+
+    // While Fn is held, show what each key does on the Fn layer.
+    if (layer_state_is(_FN)) {
+        oled_write_P(PSTR("Fn  knob=brightness\n"), true);
+        oled_write_P(PSTR("Boot   LEDs   Effect\n"), false);
+        oled_write_P(PSTR("Paste  Hands  MicOff\n"), false);
+        oled_write_P(PSTR("       PrtSc  TaskMgr"), false);
+        return false;
+    }
+
     draw_icon(0, 0, spotify_icon);
     oled_set_cursor(2, 0);
     oled_write_P(PSTR("Spotify"), false);
 
     if (!active) {
+        oled_set_cursor(10, 0);
+        oled_write_P(host_seen ? PSTR("idle") : PSTR("no PC link"), false);
         oled_set_cursor(0, 1);
-        oled_write_P(host_seen ? PSTR("Nothing playing") : PSTR("Waiting for PC..."), false);
+        oled_write_P(PSTR("Prev   Play   Next"), false);
+        oled_set_cursor(0, 2);
+        oled_write_P(PSTR("Claude Wispr  Mute"), false);
         oled_set_cursor(0, 3);
-        oled_write_P(PSTR("Sage Hackpad"), false);
+        oled_write_P(PSTR("Fn     Snip   Desk"), false);
         return false;
     }
 
