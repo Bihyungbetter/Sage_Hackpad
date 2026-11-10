@@ -1,4 +1,4 @@
-# Background agent for the Sage Hackpad's OLED screens: Spotify now playing, clock and PC stats.
+# Background agent for the Sage Hackpad's OLED screens: Spotify now playing, synced lyrics, clock and PC stats.
 # Spotify info comes from Windows' media session (the same info as the volume flyout), so no login is needed.
 #   powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File hackpad_agent.ps1
 
@@ -20,13 +20,47 @@ $manager = Wait-WinRT ([Windows.Media.Control.GlobalSystemMediaTransportControls
                       ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
 
 # The OLED font is ASCII only: strip accents and replace anything else.
-function ConvertTo-OledText([string]$text) {
+function ConvertTo-OledText([string]$text, [int]$max = 64) {
     if (-not $text) { return '' }
     $plain = -join ($text.Normalize([Text.NormalizationForm]::FormD).ToCharArray() |
         Where-Object { [Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne 'NonSpacingMark' })
     $plain = -join ($plain.ToCharArray() | ForEach-Object { if ([int]$_ -ge 32 -and [int]$_ -lt 127) { $_ } else { '?' } })
-    if ($plain.Length -gt 64) { $plain = $plain.Substring(0, 64) }
+    if ($plain.Length -gt $max) { $plain = $plain.Substring(0, $max) }
     $plain
+}
+
+# Synced lyrics from LRCLIB (https://lrclib.net), a free open lyrics database; looked up once per track.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$lrclibAgent = 'SageHackpad/1.0 (+https://github.com/Bihyungbetter/Sage_Hackpad)'
+
+function Get-SyncedLyrics([string]$title, [string]$artist, [string]$album, [int]$duration) {
+    $q = "track_name=$([uri]::EscapeDataString($title))&artist_name=$([uri]::EscapeDataString($artist))"
+    $result = $null
+    try {
+        $full = $q
+        if ($album) { $full += "&album_name=$([uri]::EscapeDataString($album))" }
+        if ($duration -gt 0) { $full += "&duration=$duration" }
+        $result = Invoke-RestMethod -Uri "https://lrclib.net/api/get?$full" -UserAgent $lrclibAgent -TimeoutSec 6
+    } catch { }
+    if (-not ($result -and $result.syncedLyrics)) {
+        try {
+            $result = Invoke-RestMethod -Uri "https://lrclib.net/api/search?$q" -UserAgent $lrclibAgent -TimeoutSec 6 |
+                Where-Object { $_.syncedLyrics } | Select-Object -First 1
+        } catch { $result = $null }
+    }
+    if (-not ($result -and $result.syncedLyrics)) { return $null }
+
+    # LRC lines look like "[01:23.45] text"; a line can carry several timestamps.
+    $lines = foreach ($row in ($result.syncedLyrics -split "`n")) {
+        $stamps = [regex]::Matches($row, '\[(\d+):(\d+(?:\.\d+)?)\]')
+        if ($stamps.Count -eq 0) { continue }
+        $text = ConvertTo-OledText ($row.Substring($stamps[$stamps.Count - 1].Index + $stamps[$stamps.Count - 1].Length).Trim()) 96
+        if (-not $text) { $text = '~ ~ ~' }
+        foreach ($s in $stamps) {
+            [pscustomobject]@{ T = [int]$s.Groups[1].Value * 60 + [double]::Parse($s.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture); Text = $text }
+        }
+    }
+    return @($lines | Sort-Object T)
 }
 
 function Send-Text([byte]$command, [string]$text) {
@@ -109,6 +143,8 @@ $lastTextSent = [DateTime]::MinValue
 $lastPresses = [KeyActivity]::Presses
 $nextUpdate = [DateTime]::MinValue
 $loop = 0
+$lyricKey = $null; $lyricLines = $null; $lyricIdx = -2; $lyricStatus = 0; $lyricResend = $false
+$tlPos = 0.0; $tlStamp = [DateTime]::Now; $tlPlaying = $false
 while ($true) {
     # Fast path: forward new key presses right away so Bongo Cat taps in time.
     $presses = [KeyActivity]::Presses
@@ -116,6 +152,20 @@ while ($true) {
         $null = Send-HackpadPacket ([byte[]](6, [Math]::Min(255, $presses - $lastPresses)))
         $lastPresses = $presses
     }
+
+    # Lyrics: find the line for the current playback position and send it when it changes.
+    if ($lyricLines -and $lyricLines.Count) {
+        $now = [DateTime]::Now
+        $playPos = $tlPos + $(if ($tlPlaying) { ($now - $tlStamp).TotalSeconds } else { 0 }) + 0.3
+        $idx = -1
+        for ($i = 0; $i -lt $lyricLines.Count -and $lyricLines[$i].T -le $playPos; $i++) { $idx = $i }
+        if ($idx -ne $lyricIdx -or $lyricResend) {
+            $cur = if ($idx -ge 0) { $lyricLines[$idx].Text } else { '' }
+            $next = if ($idx + 1 -lt $lyricLines.Count) { $lyricLines[$idx + 1].Text } else { '' }
+            if ((Send-Text 7 $cur) -and (Send-Text 8 $next)) { $lyricIdx = $idx; $lyricResend = $false }
+        }
+    }
+
     if ([DateTime]::Now -lt $nextUpdate) { Start-Sleep -Milliseconds 30; continue }
 
     $loop++
@@ -133,8 +183,20 @@ while ($true) {
             $dur = [int][Math]::Min(65535, $timeline.EndTime.TotalSeconds)
             $pos = [int][Math]::Max(0, [Math]::Min($dur, $position.TotalSeconds))
             $status = if ($playback -eq 'Playing') { 2 } elseif ($title) { 1 } else { 0 }
+            $tlPos = $position.TotalSeconds; $tlStamp = [DateTime]::Now; $tlPlaying = $playback -eq 'Playing'
+
+            # New track: look up its synced lyrics once.
+            $trackKey = "$($props.Title)|$($props.Artist)"
+            if ($trackKey -ne $lyricKey) {
+                $lyricKey = $trackKey; $lyricLines = $null; $lyricIdx = -2
+                $null = Send-HackpadPacket ([byte[]](9, 3))
+                $lyricLines = Get-SyncedLyrics $props.Title $props.Artist $props.AlbumTitle $dur
+                $lyricStatus = if ($lyricLines) { 1 } else { 2 }
+                $lyricResend = $true
+            }
         } catch { $status = 0 }
     }
+    if ($status -eq 0) { $lyricKey = $null; $lyricLines = $null; $lyricStatus = 0 }
 
     $text = "$title`n$artist"
     $ok = $true
@@ -146,7 +208,11 @@ while ($true) {
         $ok = Send-HackpadPacket ([byte[]](3, $status, ($pos -shr 8), ($pos -band 255), ($dur -shr 8), ($dur -band 255)))
     }
     if ($ok) {
+        $ok = Send-HackpadPacket ([byte[]](9, $lyricStatus))
+    }
+    if ($ok) {
         $ok = Send-ClockAndStats ($loop % 2 -eq 0)
     }
+    if (-not $ok) { $lyricResend = $true }
     if (-not $ok) { $lastText = ''; $nextUpdate = [DateTime]::Now.AddSeconds(3) } else { $nextUpdate = [DateTime]::Now.AddSeconds(1) }
 }

@@ -16,7 +16,7 @@ enum layers { _BASE, _FN };
 enum custom_keycodes { SCREEN_NEXT = SAFE_RANGE }; // cycle the OLED screen
 
 // OLED screens, cycled with the bottom-right key. The choice is saved in EEPROM.
-enum screens { SCR_AUTO, SCR_SPOTIFY, SCR_CLOCK, SCR_BONGO, SCR_LUNA, SCR_STATS, SCR_COUNT };
+enum screens { SCR_AUTO, SCR_SPOTIFY, SCR_LYRICS, SCR_CLOCK, SCR_BONGO, SCR_LUNA, SCR_STATS, SCR_COUNT };
 static uint8_t  current_screen;
 static uint32_t screen_switch_time;
 
@@ -100,6 +100,9 @@ bool led_update_user(led_t led_state) {
  * 0x04 hour min sec dow month day          local time (dow 0 = Sunday)
  * 0x05 cpu% ram%               PC load
  * 0x06 count                   key presses on other keyboards (count only, no key codes)
+ * 0x07 offset total chars...  current synced lyric line chunk
+ * 0x08 offset total chars...  next lyric line chunk
+ * 0x09 status                  lyrics: 0 none playing, 1 synced, 2 not found, 3 looking up
  * 0x10 on                      per-LED override on/off
  * 0x11 index b0 b1 b2          override LED wire bytes (sent to the LED in this order)
  * 0x12 b0 b1 b2                override all LEDs' wire bytes
@@ -116,6 +119,11 @@ static uint16_t play_pos, play_dur;
 static uint32_t pos_stamp, host_stamp;
 static bool     host_seen;
 
+#define LYRIC_MAX 96
+static char    lyric_cur[LYRIC_MAX + 1];
+static char    lyric_next[LYRIC_MAX + 1];
+static uint8_t lyric_status;
+
 static uint32_t clock_base_sec, clock_stamp;
 static bool     clock_valid;
 static uint8_t  clock_dow, clock_month, clock_day;
@@ -127,9 +135,9 @@ static bool     stats_valid;
 static bool    led_override;
 static uint8_t led_wire[RGB_MATRIX_LED_COUNT][3];
 
-static void store_chunk(char *dst, const uint8_t *data, uint8_t length) {
+static void store_chunk(char *dst, uint8_t max, const uint8_t *data, uint8_t length) {
     uint8_t offset = data[1], total = data[2];
-    if (total > TEXT_MAX) total = TEXT_MAX;
+    if (total > max) total = max;
     for (uint8_t i = 3; i < length && offset < total; i++, offset++) dst[offset] = data[i];
     dst[total] = '\0';
 }
@@ -138,8 +146,11 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
     host_stamp = timer_read32();
     host_seen  = true;
     switch (data[0]) {
-        case 0x01: store_chunk(track_title, data, length); break;
-        case 0x02: store_chunk(track_artist, data, length); break;
+        case 0x01: store_chunk(track_title, TEXT_MAX, data, length); break;
+        case 0x02: store_chunk(track_artist, TEXT_MAX, data, length); break;
+        case 0x07: store_chunk(lyric_cur, LYRIC_MAX, data, length); break;
+        case 0x08: store_chunk(lyric_next, LYRIC_MAX, data, length); break;
+        case 0x09: lyric_status = data[1]; break;
         case 0x03:
             play_status = data[1];
             play_pos    = (data[2] << 8) | data[3];
@@ -458,7 +469,56 @@ static void render_spotify(uint16_t tick) {
         for (uint8_t y = y0 + 1; y < y1; y++) oled_write_pixel(x, y, true);
 }
 
-static const char *const screen_names[SCR_COUNT] = {"Auto", "Spotify", "Clock", "Bongo Cat", "Luna", "PC stats"};
+/* ---------- Lyrics (synced line from the host) ---------- */
+// Word-wraps `text` into rows of 21 characters starting at `line`; returns the number of rows used.
+static uint8_t write_wrapped(uint8_t line, uint8_t max_rows, const char *text) {
+    const uint8_t width = 21;
+    uint8_t       rows  = 0;
+    while (*text && rows < max_rows) {
+        while (*text == ' ') text++;
+        uint8_t len = strlen(text), take = len;
+        if (len > width) {
+            take = width;
+            while (take > 0 && text[take] != ' ') take--; // break at the last space that fits
+            if (take == 0) take = width;                  // single long word: hard split
+        }
+        char row[22];
+        memcpy(row, text, take);
+        row[take] = '\0';
+        oled_set_cursor(0, line + rows);
+        oled_write(row, false);
+        text += take;
+        rows++;
+    }
+    return rows;
+}
+
+static bool lyrics_ready(void) {
+    return spotify_active() && lyric_status == 1;
+}
+
+static void render_lyrics(uint16_t tick) {
+    if (!spotify_active()) {
+        oled_write_P(PSTR("Lyrics"), false);
+        oled_set_cursor(0, 2);
+        oled_write_P(PSTR("Nothing playing"), false);
+        return;
+    }
+    write_marquee(0, track_title, tick);
+    if (lyric_status != 1) {
+        oled_set_cursor(0, 2);
+        oled_write_P(lyric_status == 3 ? PSTR("Finding lyrics...") : PSTR("No synced lyrics"), false);
+        return;
+    }
+    uint8_t used = write_wrapped(1, 3, lyric_cur[0] ? lyric_cur : "...");
+    if (used < 3) {
+        // Next line, underlined by a dotted rule so it reads as "up next".
+        write_marquee(3, lyric_next, tick);
+        for (uint8_t x = 0; x < 128; x += 3) oled_write_pixel(x, 23, true);
+    }
+}
+
+static const char *const screen_names[SCR_COUNT] = {"Auto", "Spotify", "Lyrics", "Clock", "Bongo Cat", "Luna", "PC stats"};
 
 bool oled_task_user(void) {
     static uint32_t frame_timer;
@@ -490,12 +550,15 @@ bool oled_task_user(void) {
 
     switch (current_screen) {
         case SCR_SPOTIFY: render_spotify(tick); break;
+        case SCR_LYRICS: render_lyrics(tick); break;
         case SCR_CLOCK: render_clock(); break;
         case SCR_BONGO: render_bongo(frame); break;
         case SCR_LUNA: render_luna(frame); break;
         case SCR_STATS: render_stats(); break;
-        default: // Auto: Spotify while music is playing, Bongo Cat otherwise
-            if (spotify_active()) {
+        default: // Auto: synced lyrics if available, else Spotify while music plays, else Bongo Cat
+            if (lyrics_ready()) {
+                render_lyrics(tick);
+            } else if (spotify_active()) {
                 render_spotify(tick);
             } else {
                 render_bongo(frame);
