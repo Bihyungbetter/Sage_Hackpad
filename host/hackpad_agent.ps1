@@ -29,6 +29,21 @@ function ConvertTo-OledText([string]$text, [int]$max = 64) {
     $plain
 }
 
+# One lyric line into display slot 0-3 (previous, current, next, after next), 28 characters per packet.
+function Send-LyricSlot([byte]$slot, [string]$text) {
+    $bytes = [Text.Encoding]::ASCII.GetBytes($text)
+    $offset = 0
+    do {
+        $count = [Math]::Min(28, $bytes.Length - $offset)
+        $packet = New-Object byte[] 32
+        $packet[0] = 0x0B; $packet[1] = $slot; $packet[2] = $offset; $packet[3] = $bytes.Length
+        if ($count -gt 0) { [Array]::Copy($bytes, $offset, $packet, 4, $count) }
+        if (-not (Send-HackpadPacket $packet)) { return $false }
+        $offset += 28
+    } while ($offset -lt $bytes.Length)
+    return $true
+}
+
 # Synced lyrics from LRCLIB (https://lrclib.net), a free open lyrics database; looked up once per track.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $lrclibAgent = 'SageHackpad/1.0 (+https://github.com/Bihyungbetter/Sage_Hackpad)'
@@ -160,11 +175,17 @@ while ($true) {
         $idx = -1
         for ($i = 0; $i -lt $lyricLines.Count -and $lyricLines[$i].T -le $playPos; $i++) { $idx = $i }
         if ($idx -ne $lyricIdx -or $lyricResend) {
-            $cur = if ($idx -ge 0) { $lyricLines[$idx].Text } else { '' }
+            # Send the previous, current and next two lines (slots 0-3), then start the line timer.
+            $ok = $true
+            for ($slot = 0; $slot -lt 4 -and $ok; $slot++) {
+                $i = $idx - 1 + $slot
+                $line = if ($i -ge 0 -and $i -lt $lyricLines.Count) { $lyricLines[$i].Text } else { '' }
+                $ok = Send-LyricSlot $slot $line
+            }
             # How long this line stays up: until the next line, measured from now (tenths of a second).
             $endT = if ($idx + 1 -lt $lyricLines.Count) { $lyricLines[$idx + 1].T } else { $playPos + 4 }
             $tenths = [int][Math]::Max(5, [Math]::Min(600, ($endT - $playPos) * 10))
-            if ((Send-Text 7 $cur) -and (Send-HackpadPacket ([byte[]](0x0A, ($tenths -shr 8), ($tenths -band 255))))) {
+            if ($ok -and (Send-HackpadPacket ([byte[]](0x0A, ($tenths -shr 8), ($tenths -band 255))))) {
                 $lyricIdx = $idx; $lyricResend = $false
             }
         }

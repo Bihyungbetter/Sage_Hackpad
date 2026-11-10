@@ -100,9 +100,9 @@ bool led_update_user(led_t led_state) {
  * 0x04 hour min sec dow month day          local time (dow 0 = Sunday)
  * 0x05 cpu% ram%               PC load
  * 0x06 count                   key presses on other keyboards (count only, no key codes)
- * 0x07 offset total chars...  current synced lyric line chunk
  * 0x09 status                  lyrics: 0 none playing, 1 synced, 2 not found, 3 looking up
  * 0x0A dur_hi dur_lo           current lyric line started now; lasts dur tenths of a second
+ * 0x0B slot offset total chars...  lyric line chunk; slot 0 previous, 1 current, 2 next, 3 after next
  * 0x10 on                      per-LED override on/off
  * 0x11 index b0 b1 b2          override LED wire bytes (sent to the LED in this order)
  * 0x12 b0 b1 b2                override all LEDs' wire bytes
@@ -120,7 +120,8 @@ static uint32_t pos_stamp, host_stamp;
 static bool     host_seen;
 
 #define LYRIC_MAX 96
-static char     lyric_cur[LYRIC_MAX + 1];
+enum lyric_slots { LYR_PREV, LYR_CUR, LYR_NEXT, LYR_NEXT2, LYR_SLOTS };
+static char     lyric_rows[LYR_SLOTS][LYRIC_MAX + 1];
 static uint8_t  lyric_status;
 static uint32_t lyric_start, lyric_dur_ms;
 
@@ -148,7 +149,9 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
     switch (data[0]) {
         case 0x01: store_chunk(track_title, TEXT_MAX, data, length); break;
         case 0x02: store_chunk(track_artist, TEXT_MAX, data, length); break;
-        case 0x07: store_chunk(lyric_cur, LYRIC_MAX, data, length); break;
+        case 0x0B:
+            if (data[1] < LYR_SLOTS) store_chunk(lyric_rows[data[1]], LYRIC_MAX, data + 1, length - 1);
+            break;
         case 0x09: lyric_status = data[1]; break;
         case 0x0A: // current line starts now and lasts this many tenths of a second
             lyric_start  = timer_read32();
@@ -238,7 +241,8 @@ static void write_time(uint16_t secs) {
 #include "glcdfont.c" // QMK's 6x8 OLED font: 6 column bytes per glyph, LSB at the top
 
 // Draws `text` with its top-left at pixel (x, y), scaled up `scale` times, clipped to the screen.
-static void draw_text_px(int16_t x, int16_t y, const char *text, uint8_t scale) {
+// With `on` false the glyph pixels are cleared instead (for text on a lit background).
+static void draw_text_px_color(int16_t x, int16_t y, const char *text, uint8_t scale, bool on) {
     const int16_t advance = 6 * scale;
     for (; *text; text++, x += advance) {
         if (x >= 128) break;
@@ -251,11 +255,15 @@ static void draw_text_px(int16_t x, int16_t y, const char *text, uint8_t scale) 
                 for (uint8_t dy = 0; dy < scale; dy++)
                     for (uint8_t dx = 0; dx < scale; dx++) {
                         int16_t px = x + col * scale + dx, py = y + bit * scale + dy;
-                        if (px >= 0 && px < 128 && py >= 0 && py < 32) oled_write_pixel(px, py, true);
+                        if (px >= 0 && px < 128 && py >= 0 && py < 32) oled_write_pixel(px, py, on);
                     }
             }
         }
     }
+}
+
+static void draw_text_px(int16_t x, int16_t y, const char *text, uint8_t scale) {
+    draw_text_px_color(x, y, text, scale, true);
 }
 
 // Small text on row `y` that glides left one pixel per frame and loops when it is wider than the screen.
@@ -494,42 +502,54 @@ static bool lyrics_ready(void) {
     return spotify_active() && lyric_status == 1;
 }
 
-// Title glides along the top; the current line sits centered, or slides slowly across when it
-// is wider than the screen; a thin bar shows the line's progress.
+// Horizontal position of the current line: centered if it fits, otherwise it holds briefly and
+// then slides slowly so its end arrives near the line's end time (capped at ~5 characters/s).
+static int16_t current_line_x(const char *line, uint32_t elapsed, uint32_t dur) {
+    int16_t w = strlen(line) * 6;
+    if (w <= 128) return (128 - w) / 2;
+    const uint32_t hold = 600, max_px_per_s = 30;
+    uint32_t       usable = dur * 95 / 100 > hold + 800 ? dur * 95 / 100 - hold : 800;
+    int16_t        travel = w - 128 + 4;
+    uint32_t       t      = elapsed > hold ? elapsed - hold : 0;
+    uint32_t       paced  = t * travel / usable, capped = t * max_px_per_s / 1000;
+    uint32_t       moved  = paced < capped ? paced : capped;
+    return 2 - (int16_t)(moved > (uint32_t)travel ? travel : moved);
+}
+
+// Spotify-style lyrics: previous, current (highlighted) and the next two lines stacked as a list
+// that glides up one row whenever the song reaches a new line.
 static void render_lyrics(uint16_t frame) {
     if (!spotify_active()) {
         draw_text_px(0, 0, "Lyrics", 1);
         draw_text_px(0, 16, "Nothing playing", 1);
         return;
     }
-    draw_marquee_px(0, track_title, frame);
     if (lyric_status != 1) {
+        draw_marquee_px(0, track_title, frame);
         draw_text_px(0, 16, lyric_status == 3 ? "Finding lyrics..." : "No synced lyrics", 1);
         return;
     }
 
-    const char *line    = lyric_cur[0] ? lyric_cur : "...";
-    int16_t     w       = strlen(line) * 6;
-    uint32_t    elapsed = timer_elapsed32(lyric_start);
-    uint32_t    dur     = lyric_dur_ms ? lyric_dur_ms : 4000;
-    int16_t     x;
-    if (w <= 128) {
-        x = (128 - w) / 2;
-    } else {
-        // Hold briefly, then slide so the line's end arrives near the line's end time,
-        // never faster than ~5 characters per second so it stays readable.
-        const uint32_t hold = 600, max_px_per_s = 30;
-        uint32_t       usable = dur * 95 / 100 > hold + 800 ? dur * 95 / 100 - hold : 800;
-        int16_t        travel = w - 128 + 4;
-        uint32_t       t      = elapsed > hold ? elapsed - hold : 0;
-        uint32_t       paced  = t * travel / usable, capped = t * max_px_per_s / 1000;
-        uint32_t       moved  = paced < capped ? paced : capped;
-        x = 2 - (int16_t)(moved > (uint32_t)travel ? travel : moved);
-    }
-    draw_text_px(x, 14, line, 1);
+    const uint32_t scroll_ms = 250;
+    uint32_t       elapsed   = timer_elapsed32(lyric_start);
+    uint32_t       dur       = lyric_dur_ms ? lyric_dur_ms : 4000;
+    int16_t        shift     = elapsed >= scroll_ms ? 0 : 8 - (int16_t)(elapsed * 8 / scroll_ms); // 8 -> 0 px
 
-    uint8_t bar = elapsed >= dur ? 128 : elapsed * 128 / dur;
-    for (uint8_t i = 0; i < bar; i++) oled_write_pixel(i, 31, true);
+    for (uint8_t slot = 0; slot < LYR_SLOTS; slot++) {
+        int16_t     y    = slot * 8 + shift;
+        const char *text = lyric_rows[slot];
+        if (slot == LYR_CUR) {
+            // Highlight bar with the text cut out of it.
+            for (int16_t yy = y; yy < y + 8; yy++)
+                if (yy >= 0 && yy < 32)
+                    for (uint8_t x = 0; x < 128; x++) oled_write_pixel(x, yy, true);
+            const char *line = text[0] ? text : "...";
+            draw_text_px_color(current_line_x(line, elapsed, dur), y, line, 1, false);
+        } else if (text[0]) {
+            int16_t w = strlen(text) * 6;
+            draw_text_px(w <= 128 ? (128 - w) / 2 : 0, y, text, 1);
+        }
+    }
 }
 
 static const char *const screen_names[SCR_COUNT] = {"Auto", "Spotify", "Lyrics", "Clock", "Bongo Cat", "Luna", "PC stats"};
