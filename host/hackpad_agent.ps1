@@ -161,8 +161,12 @@ while ($true) {
         for ($i = 0; $i -lt $lyricLines.Count -and $lyricLines[$i].T -le $playPos; $i++) { $idx = $i }
         if ($idx -ne $lyricIdx -or $lyricResend) {
             $cur = if ($idx -ge 0) { $lyricLines[$idx].Text } else { '' }
-            $next = if ($idx + 1 -lt $lyricLines.Count) { $lyricLines[$idx + 1].Text } else { '' }
-            if ((Send-Text 7 $cur) -and (Send-Text 8 $next)) { $lyricIdx = $idx; $lyricResend = $false }
+            # How long this line stays up: until the next line, measured from now (tenths of a second).
+            $endT = if ($idx + 1 -lt $lyricLines.Count) { $lyricLines[$idx + 1].T } else { $playPos + 4 }
+            $tenths = [int][Math]::Max(5, [Math]::Min(600, ($endT - $playPos) * 10))
+            if ((Send-Text 7 $cur) -and (Send-HackpadPacket ([byte[]](0x0A, ($tenths -shr 8), ($tenths -band 255))))) {
+                $lyricIdx = $idx; $lyricResend = $false
+            }
         }
     }
 

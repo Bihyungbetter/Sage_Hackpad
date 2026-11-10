@@ -101,8 +101,8 @@ bool led_update_user(led_t led_state) {
  * 0x05 cpu% ram%               PC load
  * 0x06 count                   key presses on other keyboards (count only, no key codes)
  * 0x07 offset total chars...  current synced lyric line chunk
- * 0x08 offset total chars...  next lyric line chunk
  * 0x09 status                  lyrics: 0 none playing, 1 synced, 2 not found, 3 looking up
+ * 0x0A dur_hi dur_lo           current lyric line started now; lasts dur tenths of a second
  * 0x10 on                      per-LED override on/off
  * 0x11 index b0 b1 b2          override LED wire bytes (sent to the LED in this order)
  * 0x12 b0 b1 b2                override all LEDs' wire bytes
@@ -120,9 +120,9 @@ static uint32_t pos_stamp, host_stamp;
 static bool     host_seen;
 
 #define LYRIC_MAX 96
-static char    lyric_cur[LYRIC_MAX + 1];
-static char    lyric_next[LYRIC_MAX + 1];
-static uint8_t lyric_status;
+static char     lyric_cur[LYRIC_MAX + 1];
+static uint8_t  lyric_status;
+static uint32_t lyric_start, lyric_dur_ms;
 
 static uint32_t clock_base_sec, clock_stamp;
 static bool     clock_valid;
@@ -149,8 +149,11 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
         case 0x01: store_chunk(track_title, TEXT_MAX, data, length); break;
         case 0x02: store_chunk(track_artist, TEXT_MAX, data, length); break;
         case 0x07: store_chunk(lyric_cur, LYRIC_MAX, data, length); break;
-        case 0x08: store_chunk(lyric_next, LYRIC_MAX, data, length); break;
         case 0x09: lyric_status = data[1]; break;
+        case 0x0A: // current line starts now and lasts this many tenths of a second
+            lyric_start  = timer_read32();
+            lyric_dur_ms = ((data[1] << 8) | data[2]) * 100UL;
+            break;
         case 0x03:
             play_status = data[1];
             play_pos    = (data[2] << 8) | data[3];
@@ -231,24 +234,41 @@ static void write_time(uint16_t secs) {
     oled_write(buf, false);
 }
 
-// Writes `text` on `line`, scrolling it as a marquee when it is wider than the screen.
-static void write_marquee(uint8_t line, const char *text, uint16_t tick) {
-    const uint8_t width = 21, gap = 4;
-    uint8_t len = strlen(text);
-    char out[22];
-    if (len <= width) {
-        memset(out, ' ', width);
-        memcpy(out, text, len);
-    } else {
-        uint16_t cycle = len + gap, start = tick % cycle;
-        for (uint8_t i = 0; i < width; i++) {
-            uint16_t p = (start + i) % cycle;
-            out[i] = p < len ? text[p] : ' ';
+/* ---------- Pixel text: smooth scrolling and 2x size ---------- */
+#include "glcdfont.c" // QMK's 6x8 OLED font: 6 column bytes per glyph, LSB at the top
+
+// Draws `text` with its top-left at pixel (x, y), scaled up `scale` times, clipped to the screen.
+static void draw_text_px(int16_t x, int16_t y, const char *text, uint8_t scale) {
+    const int16_t advance = 6 * scale;
+    for (; *text; text++, x += advance) {
+        if (x >= 128) break;
+        if (x + advance <= 0) continue;
+        const unsigned char *glyph = font + (uint8_t)*text * 6;
+        for (uint8_t col = 0; col < 6; col++) {
+            uint8_t bits = pgm_read_byte(glyph + col);
+            for (uint8_t bit = 0; bits; bit++, bits >>= 1) {
+                if (!(bits & 1)) continue;
+                for (uint8_t dy = 0; dy < scale; dy++)
+                    for (uint8_t dx = 0; dx < scale; dx++) {
+                        int16_t px = x + col * scale + dx, py = y + bit * scale + dy;
+                        if (px >= 0 && px < 128 && py >= 0 && py < 32) oled_write_pixel(px, py, true);
+                    }
+            }
         }
     }
-    out[width] = '\0';
-    oled_set_cursor(0, line);
-    oled_write(out, false);
+}
+
+// Small text on row `y` that glides left one pixel per frame and loops when it is wider than the screen.
+static void draw_marquee_px(int16_t y, const char *text, uint16_t frame) {
+    const int16_t gap = 30;
+    int16_t       w   = strlen(text) * 6;
+    if (w <= 128) {
+        draw_text_px(0, y, text, 1);
+        return;
+    }
+    int16_t offset = frame % (w + gap);
+    draw_text_px(-offset, y, text, 1);
+    draw_text_px(-offset + w + gap, y, text, 1);
 }
 
 /* ---------- Idle pets (community animations, see pets_data.h) ---------- */
@@ -429,7 +449,7 @@ static bool spotify_active(void) {
     return host_seen && timer_elapsed32(host_stamp) < 5000 && play_status != 0;
 }
 
-static void render_spotify(uint16_t tick) {
+static void render_spotify(uint16_t frame) {
     draw_icon(0, 0, spotify_icon);
     oled_set_cursor(2, 0);
     oled_write_P(PSTR("Spotify"), false);
@@ -446,8 +466,8 @@ static void render_spotify(uint16_t tick) {
     if (play_dur && pos > play_dur) pos = play_dur;
 
     draw_play_state(120, 0, playing);
-    write_marquee(1, track_title, tick);
-    write_marquee(2, track_artist, tick);
+    draw_marquee_px(8, track_title, frame);
+    draw_marquee_px(16, track_artist, frame);
 
     oled_set_cursor(0, 3);
     write_time(pos);
@@ -470,52 +490,42 @@ static void render_spotify(uint16_t tick) {
 }
 
 /* ---------- Lyrics (synced line from the host) ---------- */
-// Word-wraps `text` into rows of 21 characters starting at `line`; returns the number of rows used.
-static uint8_t write_wrapped(uint8_t line, uint8_t max_rows, const char *text) {
-    const uint8_t width = 21;
-    uint8_t       rows  = 0;
-    while (*text && rows < max_rows) {
-        while (*text == ' ') text++;
-        uint8_t len = strlen(text), take = len;
-        if (len > width) {
-            take = width;
-            while (take > 0 && text[take] != ' ') take--; // break at the last space that fits
-            if (take == 0) take = width;                  // single long word: hard split
-        }
-        char row[22];
-        memcpy(row, text, take);
-        row[take] = '\0';
-        oled_set_cursor(0, line + rows);
-        oled_write(row, false);
-        text += take;
-        rows++;
-    }
-    return rows;
-}
-
 static bool lyrics_ready(void) {
     return spotify_active() && lyric_status == 1;
 }
 
-static void render_lyrics(uint16_t tick) {
+// Title glides along the top; the current line is drawn 2x and slides across like a karaoke
+// ticker, paced to finish just before the next line starts; a thin bar shows the line's progress.
+static void render_lyrics(uint16_t frame) {
     if (!spotify_active()) {
-        oled_write_P(PSTR("Lyrics"), false);
-        oled_set_cursor(0, 2);
-        oled_write_P(PSTR("Nothing playing"), false);
+        draw_text_px(0, 0, "Lyrics", 1);
+        draw_text_px(0, 16, "Nothing playing", 1);
         return;
     }
-    write_marquee(0, track_title, tick);
+    draw_marquee_px(0, track_title, frame);
     if (lyric_status != 1) {
-        oled_set_cursor(0, 2);
-        oled_write_P(lyric_status == 3 ? PSTR("Finding lyrics...") : PSTR("No synced lyrics"), false);
+        draw_text_px(0, 16, lyric_status == 3 ? "Finding lyrics..." : "No synced lyrics", 1);
         return;
     }
-    uint8_t used = write_wrapped(1, 3, lyric_cur[0] ? lyric_cur : "...");
-    if (used < 3) {
-        // Next line, underlined by a dotted rule so it reads as "up next".
-        write_marquee(3, lyric_next, tick);
-        for (uint8_t x = 0; x < 128; x += 3) oled_write_pixel(x, 23, true);
+
+    const char *line    = lyric_cur[0] ? lyric_cur : "...";
+    int16_t     w       = strlen(line) * 12;
+    uint32_t    elapsed = timer_elapsed32(lyric_start);
+    uint32_t    dur     = lyric_dur_ms ? lyric_dur_ms : 4000;
+    int16_t     x;
+    if (w <= 128) {
+        x = (128 - w) / 2;
+    } else {
+        const uint32_t hold   = 400;
+        uint32_t       usable = dur * 85 / 100 > hold + 800 ? dur * 85 / 100 - hold : 800;
+        int16_t        travel = w - 128 + 6;
+        uint32_t       moved  = elapsed > hold ? (elapsed - hold) * travel / usable : 0;
+        x = 3 - (int16_t)(moved > (uint32_t)travel ? travel : moved);
     }
+    draw_text_px(x, 11, line, 2);
+
+    uint8_t bar = elapsed >= dur ? 128 : elapsed * 128 / dur;
+    for (uint8_t i = 0; i < bar; i++) oled_write_pixel(i, 31, true);
 }
 
 static const char *const screen_names[SCR_COUNT] = {"Auto", "Spotify", "Lyrics", "Clock", "Bongo Cat", "Luna", "PC stats"};
@@ -526,7 +536,6 @@ bool oled_task_user(void) {
     if (timer_elapsed32(frame_timer) < 50) return false;
     frame_timer = timer_read32();
     frame++;
-    uint16_t tick = frame / 5; // marquee step every 250ms
 
     oled_clear();
 
@@ -549,17 +558,17 @@ bool oled_task_user(void) {
     }
 
     switch (current_screen) {
-        case SCR_SPOTIFY: render_spotify(tick); break;
-        case SCR_LYRICS: render_lyrics(tick); break;
+        case SCR_SPOTIFY: render_spotify(frame); break;
+        case SCR_LYRICS: render_lyrics(frame); break;
         case SCR_CLOCK: render_clock(); break;
         case SCR_BONGO: render_bongo(frame); break;
         case SCR_LUNA: render_luna(frame); break;
         case SCR_STATS: render_stats(); break;
         default: // Auto: synced lyrics if available, else Spotify while music plays, else Bongo Cat
             if (lyrics_ready()) {
-                render_lyrics(tick);
+                render_lyrics(frame);
             } else if (spotify_active()) {
-                render_spotify(tick);
+                render_spotify(frame);
             } else {
                 render_bongo(frame);
             }
