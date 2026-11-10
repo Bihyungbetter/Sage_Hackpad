@@ -1,6 +1,6 @@
-# Streams Spotify's current track to the Sage Hackpad's OLED.
-# Reads Windows' media session (the same info as the volume flyout), so no Spotify login is needed.
-#   powershell -ExecutionPolicy Bypass -File spotify_oled.ps1
+# Background agent for the Sage Hackpad's OLED screens: Spotify now playing, clock and PC stats.
+# Spotify info comes from Windows' media session (the same info as the volume flyout), so no login is needed.
+#   powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File hackpad_agent.ps1
 
 . "$PSScriptRoot\hackpad_link.ps1"
 
@@ -43,9 +43,23 @@ function Send-Text([byte]$command, [string]$text) {
     return $true
 }
 
+function Send-ClockAndStats([bool]$withStats) {
+    $now = Get-Date
+    $ok = Send-HackpadPacket ([byte[]](4, $now.Hour, $now.Minute, $now.Second, [int]$now.DayOfWeek, $now.Month, $now.Day))
+    if ($ok -and $withStats) {
+        $cpu = [int](Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+        $os = Get-CimInstance Win32_OperatingSystem
+        $ram = [int](100 - 100 * $os.FreePhysicalMemory / $os.TotalVisibleMemorySize)
+        $ok = Send-HackpadPacket ([byte[]](5, [Math]::Min(100, $cpu), [Math]::Min(100, $ram)))
+    }
+    return $ok
+}
+
 $lastText = ''
 $lastTextSent = [DateTime]::MinValue
+$loop = 0
 while ($true) {
+    $loop++
     $status = 0; $pos = 0; $dur = 0; $title = ''; $artist = ''
     $session = $manager.GetSessions() | Where-Object { $_.SourceAppUserModelId -like '*Spotify*' } | Select-Object -First 1
     if ($session) {
@@ -71,6 +85,9 @@ while ($true) {
     }
     if ($ok) {
         $ok = Send-HackpadPacket ([byte[]](3, $status, ($pos -shr 8), ($pos -band 255), ($dur -shr 8), ($dur -band 255)))
+    }
+    if ($ok) {
+        $ok = Send-ClockAndStats ($loop % 2 -eq 0)
     }
     if (-not $ok) { $lastText = ''; Start-Sleep -Seconds 3 } else { Start-Sleep -Seconds 1 }
 }

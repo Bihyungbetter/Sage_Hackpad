@@ -13,7 +13,12 @@ enum layers { _BASE, _FN };
 #define SPOTIFY  C(A(S(KC_S)))     // Start Menu shortcut: open Spotify
 #define DESKTOP  G(KC_D)           // Show desktop
 #define MIC_MUTE G(A(KC_K))        // Windows 11 microphone mute
-enum custom_keycodes { PET_NEXT = SAFE_RANGE }; // switch the idle OLED pet
+enum custom_keycodes { SCREEN_NEXT = SAFE_RANGE }; // cycle the OLED screen
+
+// OLED screens, cycled with Fn + bottom-right. The choice is saved in EEPROM.
+enum screens { SCR_AUTO, SCR_SPOTIFY, SCR_CLOCK, SCR_BONGO, SCR_LUNA, SCR_STATS, SCR_COUNT };
+static uint8_t  current_screen;
+static uint32_t screen_switch_time;
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     /* Knob and OLED at the top.
@@ -28,12 +33,12 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     ),
     /*  Bootloader  LEDs on/off   LED effect
      *  Paste last  Hands-free    Mic mute
-     *  (held)      Print Screen  Switch pet
+     *  (held)      Print Screen  Next OLED screen
      */
     [_FN] = LAYOUT(
         QK_BOOT,  RM_TOGG,  RM_NEXT,
         WISPR_PL, WISPR_HF, MIC_MUTE,
-        _______,  KC_PSCR,  PET_NEXT
+        _______,  KC_PSCR,  SCREEN_NEXT
     )
 };
 
@@ -57,6 +62,8 @@ void keyboard_post_init_user(void) {
     rgb_matrix_mode_noeeprom(RGB_MATRIX_CYCLE_ALL);
     rgb_matrix_sethsv_noeeprom(0, 255, DEFAULT_LED_VAL);
     rgb_matrix_set_speed_noeeprom(DEFAULT_LED_SPD);
+
+    current_screen = eeconfig_read_user() % SCR_COUNT;
 }
 
 // Each Scroll Lock toggle from the host steps LED brightness up: 40 -> 80 -> 120 -> 160 -> 200 -> 40.
@@ -79,6 +86,8 @@ bool led_update_user(led_t led_state) {
  * 0x01 offset total chars...  track title chunk
  * 0x02 offset total chars...  artist chunk
  * 0x03 status pos_hi pos_lo dur_hi dur_lo   status: 0 none, 1 paused, 2 playing
+ * 0x04 hour min sec dow month day          local time (dow 0 = Sunday)
+ * 0x05 cpu% ram%               PC load
  * 0x10 on                      per-LED override on/off
  * 0x11 index b0 b1 b2          override LED wire bytes (sent to the LED in this order)
  * 0x12 b0 b1 b2                override all LEDs' wire bytes
@@ -94,6 +103,14 @@ static uint8_t  play_status;
 static uint16_t play_pos, play_dur;
 static uint32_t pos_stamp, host_stamp;
 static bool     host_seen;
+
+static uint32_t clock_base_sec, clock_stamp;
+static bool     clock_valid;
+static uint8_t  clock_dow, clock_month, clock_day;
+
+static uint8_t  stat_cpu, stat_ram;
+static uint32_t stats_stamp;
+static bool     stats_valid;
 
 static bool    led_override;
 static uint8_t led_wire[RGB_MATRIX_LED_COUNT][3];
@@ -116,6 +133,20 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
             play_pos    = (data[2] << 8) | data[3];
             play_dur    = (data[4] << 8) | data[5];
             pos_stamp   = timer_read32();
+            break;
+        case 0x04:
+            clock_base_sec = data[1] * 3600UL + data[2] * 60UL + data[3];
+            clock_dow      = data[4];
+            clock_month    = data[5];
+            clock_day      = data[6];
+            clock_stamp    = timer_read32();
+            clock_valid    = true;
+            break;
+        case 0x05:
+            stat_cpu    = data[1];
+            stat_ram    = data[2];
+            stats_stamp = timer_read32();
+            stats_valid = true;
             break;
         case 0x10: led_override = data[1]; break;
         case 0x11:
@@ -252,66 +283,136 @@ static void render_luna(uint16_t frame) {
     draw_luna_sprite(s, x);
 }
 
-enum pets { PET_BONGO, PET_LUNA, PET_COUNT };
-static uint8_t current_pet = PET_BONGO;
-
-static void render_pet(uint16_t frame) {
-    if (current_pet == PET_LUNA) {
-        render_luna(frame);
-    } else {
-        render_bongo(frame);
-    }
-}
-
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (record->event.pressed) {
         uint32_t now = timer_read32();
         press_times[press_idx++ & 7] = now ? now : 1;
-        if (keycode == PET_NEXT) {
-            current_pet = (current_pet + 1) % PET_COUNT;
+        if (keycode == SCREEN_NEXT) {
+            current_screen     = (current_screen + 1) % SCR_COUNT;
+            screen_switch_time = now ? now : 1;
+            eeconfig_update_user(current_screen);
             return false;
         }
     }
     return true;
 }
 
-bool oled_task_user(void) {
-    static uint32_t frame_timer;
-    static uint16_t frame;
-    if (timer_elapsed32(frame_timer) < 50) return false;
-    frame_timer = timer_read32();
-    frame++;
-    uint16_t tick = frame / 5; // marquee step every 250ms
+/* ---------- Clock (big 7-segment digits, time synced from the PC) ---------- */
+static void fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+    for (uint8_t dy = 0; dy < h; dy++)
+        for (uint8_t dx = 0; dx < w; dx++) oled_write_pixel(x + dx, y + dy, true);
+}
 
-    bool active = host_seen && timer_elapsed32(host_stamp) < 5000 && play_status != 0;
+// Segments a-g as bits 0-6.
+static const uint8_t seven_seg[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
 
-    oled_clear();
+static void draw_digit(uint8_t x, uint8_t y, uint8_t digit) {
+    const uint8_t w = 14, h = 24, t = 3, half = h / 2;
+    uint8_t       s = seven_seg[digit];
+    if (s & 0x01) fill_rect(x + t, y, w - 2 * t, t);                 // a
+    if (s & 0x02) fill_rect(x + w - t, y + t, t, half - t);          // b
+    if (s & 0x04) fill_rect(x + w - t, y + half, t, half - t);       // c
+    if (s & 0x08) fill_rect(x + t, y + h - t, w - 2 * t, t);         // d
+    if (s & 0x10) fill_rect(x, y + half, t, half - t);               // e
+    if (s & 0x20) fill_rect(x, y + t, t, half - t);                  // f
+    if (s & 0x40) fill_rect(x + t, y + half - 1, w - 2 * t, t);      // g
+}
 
-    // While Fn is held, show what each key does on the Fn layer.
-    if (layer_state_is(_FN)) {
-        oled_write_P(PSTR("Fn  knob=brightness\n"), true);
-        oled_write_P(PSTR("Boot   LEDs   Effect\n"), false);
-        oled_write_P(PSTR("Paste  Hands  MicOff\n"), false);
-        oled_write_P(PSTR("       PrtSc  Pet"), false);
-        return false;
+static void render_clock(void) {
+    if (!clock_valid) {
+        oled_set_cursor(0, 1);
+        oled_write_P(PSTR("Clock: waiting for PC"), false);
+        return;
     }
+    static const char days[7][4]    = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char months[13][4] = {"", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-    if (!active) {
-        // Show the key legend for the first 5 seconds after plugging in, then animate.
-        if (timer_read32() < 5000) {
-            oled_write_P(PSTR("Sage Hackpad  keys:\n"), true);
-            oled_write_P(PSTR("Prev   Play   Next\n"), false);
-            oled_write_P(PSTR("Claude Wispr  Mute\n"), false);
-            oled_write_P(PSTR("Fn     Spot   Desk"), false);
-        } else {
-            render_pet(frame);
-        }
-        return false;
+    uint32_t now  = (clock_base_sec + timer_elapsed32(clock_stamp) / 1000) % 86400;
+    uint8_t  hour = now / 3600, minute = now / 60 % 60, second = now % 60;
+    bool     pm   = hour >= 12;
+    uint8_t  h12  = hour % 12 ? hour % 12 : 12;
+
+    const uint8_t y = 4;
+    if (h12 >= 10) draw_digit(2, y, h12 / 10);
+    draw_digit(20, y, h12 % 10);
+    if (second % 2 == 0) { // blinking colon
+        fill_rect(38, y + 6, 3, 3);
+        fill_rect(38, y + 15, 3, 3);
     }
+    draw_digit(45, y, minute / 10);
+    draw_digit(63, y, minute % 10);
 
+    char buf[8];
+    oled_set_cursor(14, 0);
+    oled_write_P(pm ? PSTR("PM") : PSTR("AM"), false);
+    buf[0] = ':';
+    buf[1] = '0' + second / 10;
+    buf[2] = '0' + second % 10;
+    buf[3] = '\0';
+    oled_set_cursor(14, 1);
+    oled_write(buf, false);
+    oled_set_cursor(14, 2);
+    oled_write(days[clock_dow % 7], false);
+    oled_set_cursor(14, 3);
+    oled_write(months[clock_month <= 12 ? clock_month : 0], false);
+    buf[0] = ' ';
+    buf[1] = clock_day >= 10 ? '0' + clock_day / 10 : ' ';
+    buf[2] = '0' + clock_day % 10;
+    oled_write(buf, false);
+}
+
+/* ---------- PC stats ---------- */
+static void draw_stat_row(uint8_t line, const char *label, uint8_t percent) {
+    const uint8_t x0 = 22, x1 = 98;
+    uint8_t       y0 = line * 8 + 1, y1 = line * 8 + 6;
+    if (percent > 100) percent = 100;
+    oled_set_cursor(0, line);
+    oled_write(label, false);
+    for (uint8_t x = x0; x <= x1; x++) {
+        oled_write_pixel(x, y0, true);
+        oled_write_pixel(x, y1, true);
+    }
+    for (uint8_t yy = y0; yy <= y1; yy++) {
+        oled_write_pixel(x0, yy, true);
+        oled_write_pixel(x1, yy, true);
+    }
+    fill_rect(x0 + 1, y0 + 1, (uint16_t)(x1 - x0 - 1) * percent / 100, y1 - y0 - 1);
+    char buf[5];
+    buf[0] = percent >= 100 ? '1' : ' ';
+    buf[1] = percent >= 10 ? '0' + percent / 10 % 10 : ' ';
+    buf[2] = '0' + percent % 10;
+    buf[3] = '%';
+    buf[4] = '\0';
+    oled_set_cursor(17, line);
+    oled_write(buf, false);
+}
+
+static void render_stats(void) {
+    oled_write_P(PSTR("PC stats"), false);
+    if (!stats_valid || timer_elapsed32(stats_stamp) > 10000) {
+        oled_set_cursor(0, 2);
+        oled_write_P(PSTR("waiting for PC..."), false);
+        return;
+    }
+    draw_stat_row(1, "CPU", stat_cpu);
+    draw_stat_row(2, "RAM", stat_ram);
+}
+
+/* ---------- Spotify ---------- */
+static bool spotify_active(void) {
+    return host_seen && timer_elapsed32(host_stamp) < 5000 && play_status != 0;
+}
+
+static void render_spotify(uint16_t tick) {
     draw_icon(0, 0, spotify_icon);
     oled_set_cursor(2, 0);
     oled_write_P(PSTR("Spotify"), false);
+
+    if (!spotify_active()) {
+        oled_set_cursor(0, 2);
+        oled_write_P(host_seen ? PSTR("Nothing playing") : PSTR("waiting for PC..."), false);
+        return;
+    }
 
     bool     playing = play_status == 2;
     uint16_t pos     = play_pos;
@@ -340,7 +441,64 @@ bool oled_task_user(void) {
     }
     for (uint8_t x = x0 + 1; x <= x0 + fill; x++)
         for (uint8_t y = y0 + 1; y < y1; y++) oled_write_pixel(x, y, true);
+}
 
+static const char *const screen_names[SCR_COUNT] = {"Auto", "Spotify", "Clock", "Bongo Cat", "Luna", "PC stats"};
+
+bool oled_task_user(void) {
+    static uint32_t frame_timer;
+    static uint16_t frame;
+    if (timer_elapsed32(frame_timer) < 50) return false;
+    frame_timer = timer_read32();
+    frame++;
+    uint16_t tick = frame / 5; // marquee step every 250ms
+
+    oled_clear();
+
+    // While Fn is held, show what each key does on the Fn layer.
+    if (layer_state_is(_FN)) {
+        oled_write_P(PSTR("Fn  knob=brightness\n"), true);
+        oled_write_P(PSTR("Boot   LEDs   Effect\n"), false);
+        oled_write_P(PSTR("Paste  Hands  MicOff\n"), false);
+        oled_write_P(PSTR("       PrtSc  Screen"), false);
+        return false;
+    }
+
+    // Key legend for the first 5 seconds after plugging in.
+    if (timer_read32() < 5000) {
+        oled_write_P(PSTR("Sage Hackpad  keys:\n"), true);
+        oled_write_P(PSTR("Prev   Play   Next\n"), false);
+        oled_write_P(PSTR("Claude Wispr  Mute\n"), false);
+        oled_write_P(PSTR("Fn     Spot   Desk"), false);
+        return false;
+    }
+
+    switch (current_screen) {
+        case SCR_SPOTIFY: render_spotify(tick); break;
+        case SCR_CLOCK: render_clock(); break;
+        case SCR_BONGO: render_bongo(frame); break;
+        case SCR_LUNA: render_luna(frame); break;
+        case SCR_STATS: render_stats(); break;
+        default: // Auto: Spotify while music is playing, Bongo Cat otherwise
+            if (spotify_active()) {
+                render_spotify(tick);
+            } else {
+                render_bongo(frame);
+            }
+            break;
+    }
+
+    // Briefly show the screen's name after switching.
+    if (screen_switch_time && timer_elapsed32(screen_switch_time) < 1200) {
+        char        label[22];
+        const char *name = screen_names[current_screen];
+        uint8_t     len = strlen(name), pad = (21 - len) / 2;
+        memset(label, ' ', 21);
+        memcpy(label + pad, name, len);
+        label[21] = '\0';
+        oled_set_cursor(0, 0);
+        oled_write(label, true);
+    }
     return false;
 }
 #endif
