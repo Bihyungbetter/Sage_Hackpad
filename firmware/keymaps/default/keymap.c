@@ -494,8 +494,8 @@ static bool lyrics_ready(void) {
     return spotify_active() && lyric_status == 1;
 }
 
-// Title glides along the top; the current line is drawn 2x and slides across like a karaoke
-// ticker, paced to finish just before the next line starts; a thin bar shows the line's progress.
+// Title glides along the top; the current line sits centered, or slides slowly across when it
+// is wider than the screen; a thin bar shows the line's progress.
 static void render_lyrics(uint16_t frame) {
     if (!spotify_active()) {
         draw_text_px(0, 0, "Lyrics", 1);
@@ -509,20 +509,24 @@ static void render_lyrics(uint16_t frame) {
     }
 
     const char *line    = lyric_cur[0] ? lyric_cur : "...";
-    int16_t     w       = strlen(line) * 12;
+    int16_t     w       = strlen(line) * 6;
     uint32_t    elapsed = timer_elapsed32(lyric_start);
     uint32_t    dur     = lyric_dur_ms ? lyric_dur_ms : 4000;
     int16_t     x;
     if (w <= 128) {
         x = (128 - w) / 2;
     } else {
-        const uint32_t hold   = 400;
-        uint32_t       usable = dur * 85 / 100 > hold + 800 ? dur * 85 / 100 - hold : 800;
-        int16_t        travel = w - 128 + 6;
-        uint32_t       moved  = elapsed > hold ? (elapsed - hold) * travel / usable : 0;
-        x = 3 - (int16_t)(moved > (uint32_t)travel ? travel : moved);
+        // Hold briefly, then slide so the line's end arrives near the line's end time,
+        // never faster than ~5 characters per second so it stays readable.
+        const uint32_t hold = 600, max_px_per_s = 30;
+        uint32_t       usable = dur * 95 / 100 > hold + 800 ? dur * 95 / 100 - hold : 800;
+        int16_t        travel = w - 128 + 4;
+        uint32_t       t      = elapsed > hold ? elapsed - hold : 0;
+        uint32_t       paced  = t * travel / usable, capped = t * max_px_per_s / 1000;
+        uint32_t       moved  = paced < capped ? paced : capped;
+        x = 2 - (int16_t)(moved > (uint32_t)travel ? travel : moved);
     }
-    draw_text_px(x, 11, line, 2);
+    draw_text_px(x, 14, line, 1);
 
     uint8_t bar = elapsed >= dur ? 128 : elapsed * 128 / dur;
     for (uint8_t i = 0; i < bar; i++) oled_write_pixel(i, 31, true);
