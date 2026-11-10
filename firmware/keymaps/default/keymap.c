@@ -15,30 +15,41 @@ enum layers { _BASE, _FN };
 #define MIC_MUTE G(A(KC_K))        // Windows 11 microphone mute
 enum custom_keycodes { SCREEN_NEXT = SAFE_RANGE }; // cycle the OLED screen
 
-// OLED screens, cycled with Fn + bottom-right. The choice is saved in EEPROM.
+// OLED screens, cycled with the bottom-right key. The choice is saved in EEPROM.
 enum screens { SCR_AUTO, SCR_SPOTIFY, SCR_CLOCK, SCR_BONGO, SCR_LUNA, SCR_STATS, SCR_COUNT };
 static uint8_t  current_screen;
 static uint32_t screen_switch_time;
+
+// Key activity that animates the pets: presses on the hackpad itself, plus press
+// counts the host agent reports for every other keyboard (raw HID 0x06).
+static uint32_t press_times[8];
+static uint8_t  press_idx;
+static uint32_t last_local_press;
+
+static void note_press(void) {
+    uint32_t now = timer_read32();
+    press_times[press_idx++ & 7] = now ? now : 1;
+}
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     /* Knob and OLED at the top.
      *  Prev    Play/Pause  Next
      *  Claude  Wispr       Mute
-     *  Fn      Spotify     Desktop
+     *  Fn      Spotify     Next OLED screen
      */
     [_BASE] = LAYOUT(
         KC_MPRV, KC_MPLY,  KC_MNXT,
         CLAUDE,  WISPR,    KC_MUTE,
-        MO(_FN), SPOTIFY,  DESKTOP
+        MO(_FN), SPOTIFY,  SCREEN_NEXT
     ),
     /*  Bootloader  LEDs on/off   LED effect
      *  Paste last  Hands-free    Mic mute
-     *  (held)      Print Screen  Next OLED screen
+     *  (held)      Print Screen  Show desktop
      */
     [_FN] = LAYOUT(
         QK_BOOT,  RM_TOGG,  RM_NEXT,
         WISPR_PL, WISPR_HF, MIC_MUTE,
-        _______,  KC_PSCR,  SCREEN_NEXT
+        _______,  KC_PSCR,  DESKTOP
     )
 };
 
@@ -88,6 +99,7 @@ bool led_update_user(led_t led_state) {
  * 0x03 status pos_hi pos_lo dur_hi dur_lo   status: 0 none, 1 paused, 2 playing
  * 0x04 hour min sec dow month day          local time (dow 0 = Sunday)
  * 0x05 cpu% ram%               PC load
+ * 0x06 count                   key presses on other keyboards (count only, no key codes)
  * 0x10 on                      per-LED override on/off
  * 0x11 index b0 b1 b2          override LED wire bytes (sent to the LED in this order)
  * 0x12 b0 b1 b2                override all LEDs' wire bytes
@@ -147,6 +159,11 @@ void raw_hid_receive(uint8_t *data, uint8_t length) {
             stat_ram    = data[2];
             stats_stamp = timer_read32();
             stats_valid = true;
+            break;
+        case 0x06:
+            // The host also sees the hackpad's own presses; skip those echoes.
+            if (!last_local_press || timer_elapsed32(last_local_press) > 150)
+                for (uint8_t i = 0; i < data[1] && i < 4; i++) note_press();
             break;
         case 0x10: led_override = data[1]; break;
         case 0x11:
@@ -224,9 +241,6 @@ static void write_marquee(uint8_t line, const char *text, uint16_t tick) {
 }
 
 /* ---------- Idle pets (community animations, see pets_data.h) ---------- */
-static uint32_t press_times[8];
-static uint8_t  press_idx;
-
 static uint8_t presses_within(uint32_t ms) {
     uint8_t n = 0;
     for (uint8_t i = 0; i < 8; i++)
@@ -286,7 +300,8 @@ static void render_luna(uint16_t frame) {
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (record->event.pressed) {
         uint32_t now = timer_read32();
-        press_times[press_idx++ & 7] = now ? now : 1;
+        note_press();
+        last_local_press = now ? now : 1;
         if (keycode == SCREEN_NEXT) {
             current_screen     = (current_screen + 1) % SCR_COUNT;
             screen_switch_time = now ? now : 1;
@@ -460,7 +475,7 @@ bool oled_task_user(void) {
         oled_write_P(PSTR("Fn  knob=brightness\n"), true);
         oled_write_P(PSTR("Boot   LEDs   Effect\n"), false);
         oled_write_P(PSTR("Paste  Hands  MicOff\n"), false);
-        oled_write_P(PSTR("       PrtSc  Screen"), false);
+        oled_write_P(PSTR("       PrtSc  Desktop"), false);
         return false;
     }
 
@@ -469,7 +484,7 @@ bool oled_task_user(void) {
         oled_write_P(PSTR("Sage Hackpad  keys:\n"), true);
         oled_write_P(PSTR("Prev   Play   Next\n"), false);
         oled_write_P(PSTR("Claude Wispr  Mute\n"), false);
-        oled_write_P(PSTR("Fn     Spot   Desk"), false);
+        oled_write_P(PSTR("Fn     Spot   Screen"), false);
         return false;
     }
 

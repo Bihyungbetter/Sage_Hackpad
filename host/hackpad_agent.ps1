@@ -55,10 +55,69 @@ function Send-ClockAndStats([bool]$withStats) {
     return $ok
 }
 
+# Counts key presses on every keyboard (laptop, external, ...) so the OLED pets can react.
+# Only a running count leaves this class: no key codes or text are stored or sent.
+if (-not ('KeyActivity' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class KeyActivity {
+    delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public int x, y; }
+    [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, HookProc fn, IntPtr mod, uint thread);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern int GetMessage(out MSG msg, IntPtr hwnd, uint min, uint max);
+    [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string name);
+
+    static readonly HookProc proc = OnKey;   // keep the delegate alive
+    static readonly bool[] down = new bool[256];
+    static int presses;
+
+    public static int Presses { get { return Volatile.Read(ref presses); } }
+
+    public static void Start() {
+        var t = new Thread(() => {
+            SetWindowsHookEx(13 /* WH_KEYBOARD_LL */, proc, GetModuleHandle(null), 0);
+            MSG msg;
+            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { }
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    static IntPtr OnKey(int code, IntPtr wParam, IntPtr lParam) {
+        if (code >= 0) {
+            int vk = Marshal.ReadInt32(lParam) & 0xFF;
+            int msg = wParam.ToInt32();
+            if (msg == 0x100 || msg == 0x104) {          // key down: count it once, ignore auto-repeat
+                if (!down[vk]) { down[vk] = true; Interlocked.Increment(ref presses); }
+            } else if (msg == 0x101 || msg == 0x105) {   // key up
+                down[vk] = false;
+            }
+        }
+        return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+    }
+}
+'@
+}
+[KeyActivity]::Start()
+
 $lastText = ''
 $lastTextSent = [DateTime]::MinValue
+$lastPresses = [KeyActivity]::Presses
+$nextUpdate = [DateTime]::MinValue
 $loop = 0
 while ($true) {
+    # Fast path: forward new key presses right away so Bongo Cat taps in time.
+    $presses = [KeyActivity]::Presses
+    if ($presses -ne $lastPresses) {
+        $null = Send-HackpadPacket ([byte[]](6, [Math]::Min(255, $presses - $lastPresses)))
+        $lastPresses = $presses
+    }
+    if ([DateTime]::Now -lt $nextUpdate) { Start-Sleep -Milliseconds 30; continue }
+
     $loop++
     $status = 0; $pos = 0; $dur = 0; $title = ''; $artist = ''
     $session = $manager.GetSessions() | Where-Object { $_.SourceAppUserModelId -like '*Spotify*' } | Select-Object -First 1
@@ -89,5 +148,5 @@ while ($true) {
     if ($ok) {
         $ok = Send-ClockAndStats ($loop % 2 -eq 0)
     }
-    if (-not $ok) { $lastText = ''; Start-Sleep -Seconds 3 } else { Start-Sleep -Seconds 1 }
+    if (-not $ok) { $lastText = ''; $nextUpdate = [DateTime]::Now.AddSeconds(3) } else { $nextUpdate = [DateTime]::Now.AddSeconds(1) }
 }
